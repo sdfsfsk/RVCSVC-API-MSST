@@ -1,6 +1,7 @@
 import re, os, hashlib
 import requests, json, torch, shutil, argparse, base64, http.client
 import threading
+from functools import wraps
 from difflib import SequenceMatcher
 from urllib.parse import urlparse
 
@@ -24,6 +25,121 @@ tqdm.auto.tqdm = GradioTqdm
 SVC_API_BASE = "http://127.0.0.1:7777"
 TIMEOUT = 600
 SVC_FUSION_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "SVC-Fusion", "amd"))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PIPELINE_VERSION = "rvcsvc-msst-svc-v2"
+OUTPUT_BITRATE = os.environ.get("RVCSVC_OUTPUT_BITRATE", "320k")
+CACHE_MAX_FILES = max(10, int(os.environ.get("RVCSVC_CACHE_MAX_FILES", "200")))
+MSST_KEEP_MODEL_LOADED = os.environ.get("MSST_KEEP_MODEL_LOADED", "1").strip().lower() in {"1", "true", "yes", "on"}
+CONVERT_LOCK = threading.RLock()
+_SOURCE_HASH_CACHE = {}
+
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+def _serialized(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        with CONVERT_LOCK:
+            return fn(*args, **kwargs)
+    return wrapped
+
+def _sha256_file(path):
+    resolved = os.path.abspath(path)
+    stat = os.stat(resolved)
+    key = (resolved, stat.st_size, stat.st_mtime_ns)
+    cached = _SOURCE_HASH_CACHE.get(key)
+    if cached:
+        return cached
+    digest = hashlib.sha256()
+    with open(resolved, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    value = digest.hexdigest()
+    _SOURCE_HASH_CACHE.clear()
+    _SOURCE_HASH_CACHE[key] = value
+    return value
+
+def _svc_model_fingerprint(model):
+    requested = str(model or "")
+    match = re.search(r'\(([^)]+)\)\s*$', requested)
+    basename = match.group(1) if match else os.path.basename(requested)
+    assets = []
+    if os.path.isdir(SVC_FUSION_ROOT):
+        for current, _, files in os.walk(SVC_FUSION_ROOT):
+            if basename.lower() not in current.lower() and basename.lower() not in " ".join(files).lower():
+                continue
+            for filename in files:
+                if filename.lower().endswith((".pt", ".pth", ".ckpt", ".onnx", ".yaml", ".json")):
+                    path = os.path.join(current, filename)
+                    stat = os.stat(path)
+                    assets.append((os.path.relpath(path, SVC_FUSION_ROOT), stat.st_size, stat.st_mtime_ns))
+    payload = json.dumps(sorted(assets), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16] if assets else "missing"
+
+def _msst_model_fingerprint(model):
+    try:
+        _, model_path, config_path = resolve_msst_model(model)
+        payload = [(path, os.path.getsize(path), os.path.getmtime(path)) for path in (model_path, config_path)]
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=True).encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return "missing"
+
+def _cache_areas():
+    return {"results": os.path.join(SCRIPT_DIR, "temp"), "separation": os.path.join(SCRIPT_DIR, "output")}
+
+def _cache_files(root):
+    if not os.path.isdir(root):
+        return []
+    return [os.path.join(current, name) for current, _, names in os.walk(root) for name in names]
+
+def cache_info():
+    areas = {}
+    for name, root in _cache_areas().items():
+        files = [path for path in _cache_files(root) if os.path.isfile(path)]
+        areas[name] = {"files": len(files), "bytes": sum(os.path.getsize(path) for path in files)}
+    return {"service": "RVCSVC-API MSST SVC", "areas": areas,
+            "total_files": sum(v["files"] for v in areas.values()),
+            "total_bytes": sum(v["bytes"] for v in areas.values())}
+
+@_serialized
+def clear_cache(scope="all"):
+    requested = str(scope).lower()
+    selected = _cache_areas() if requested == "all" else {k: v for k, v in _cache_areas().items() if k == requested}
+    deleted = freed = 0
+    for root in selected.values():
+        for path in _cache_files(root):
+            try:
+                size = os.path.getsize(path)
+                os.remove(path)
+                deleted += 1
+                freed += size
+            except OSError:
+                pass
+        if os.path.isdir(root):
+            for current, dirs, _ in os.walk(root, topdown=False):
+                for directory in dirs:
+                    try:
+                        os.rmdir(os.path.join(current, directory))
+                    except OSError:
+                        pass
+    return {"deleted_files": deleted, "freed_bytes": freed, "scope": requested}
+
+def _trim_cache():
+    areas = _cache_areas()
+    results = sorted((p for p in _cache_files(areas["results"]) if os.path.isfile(p)), key=os.path.getmtime, reverse=True)
+    for path in results[CACHE_MAX_FILES:]:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    root = areas["separation"]
+    jobs = [os.path.join(group.path, child.name) for group in os.scandir(root) if group.is_dir() for child in os.scandir(group.path) if child.is_dir()] if os.path.isdir(root) else []
+    jobs.sort(key=lambda path: max((os.path.getmtime(p) for p in _cache_files(path)), default=0), reverse=True)
+    for path in jobs[CACHE_MAX_FILES:]:
+        shutil.rmtree(path, ignore_errors=True)
 
 available_models = []
 available_configs = []
@@ -332,7 +448,7 @@ def _get_search_path_index(model_path):
     return 0
 
 def load_svc_model(model_name: str):
-    global current_speaker_id, current_model_type_index, loaded_speakers
+    global current_speaker_id, current_model_type_index, loaded_speakers, _gradio_info_cache
     print(f"Requesting SVC-Fusion to load model: {model_name}")
 
     import re as _re
@@ -464,7 +580,7 @@ def load_svc_model(model_name: str):
         print(f"API model loading failed: {e}")
 
     if not api_loaded:
-        print("Model not loaded via API. Using config values for inference.")
+        raise RuntimeError(f"SVC-Fusion 未确认加载模型成功: {model_name}")
 
     _gradio_info_cache = None
 
@@ -849,7 +965,7 @@ def wwy_downloader(filename, split_model="MSST", cache_name=None, msst_batch_siz
             "normalize": msst_normalize,
             "use_tta": msst_use_tta,
         },
-        release_after=True,
+        release_after=not MSST_KEEP_MODEL_LOADED,
         model_name=msst_model,
     )
 
@@ -862,10 +978,12 @@ def wwy_downloader(filename, split_model="MSST", cache_name=None, msst_batch_siz
         raise gr.Error("MSST separation failed, output not found")
 
 
-def _get_cache_key(song_name, model, key_shift, vocal_vol, inst_vol, reverb_intensity, delay_intensity, svc_f0_method, msst_batch_size, msst_num_overlap, msst_normalize, msst_use_tta, msst_model, uvr5_agg, uvr5_tta, uvr5_postprocess, uvr5_window_size, uvr5_high_end_process, shift_accompaniment):
+def _get_cache_key(song_name, model, key_shift, vocal_vol, inst_vol, reverb_intensity, delay_intensity, svc_f0_method, msst_batch_size, msst_num_overlap, msst_normalize, msst_use_tta, msst_model, uvr5_agg, uvr5_tta, uvr5_postprocess, uvr5_window_size, uvr5_high_end_process, vocal_postprocess, shift_accompaniment):
     params = {
+        "pipeline": PIPELINE_VERSION,
         "song": str(song_name),
         "model": str(model),
+        "model_assets": _svc_model_fingerprint(model),
         "key_shift": float(key_shift),
         "vocal_vol": float(vocal_vol),
         "inst_vol": float(inst_vol),
@@ -877,11 +995,13 @@ def _get_cache_key(song_name, model, key_shift, vocal_vol, inst_vol, reverb_inte
         "msst_norm": bool(msst_normalize),
         "msst_tta": bool(msst_use_tta),
         "msst_model": str(msst_model),
+        "msst_assets": _msst_model_fingerprint(msst_model),
         "uvr5_agg": int(uvr5_agg),
         "uvr5_tta": bool(uvr5_tta),
         "uvr5_postprocess": bool(uvr5_postprocess),
         "uvr5_window_size": int(uvr5_window_size),
         "uvr5_high_end": str(uvr5_high_end_process),
+        "vocal_postprocess": bool(vocal_postprocess),
         "shift_inst": bool(shift_accompaniment),
     }
     return hashlib.md5(json.dumps(params, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()[:12]
@@ -892,7 +1012,8 @@ def sanitize_filename(filename):
 # =================================================================
 #               核心转换流程 & Gradio UI
 # =================================================================
-def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, reverb_intensity = 4, delay_intensity = 0, svc_f0_method = "fcpe", msst_batch_size = 1, msst_num_overlap = 4, msst_normalize = False, msst_use_tta = False, msst_model=DEFAULT_MODEL_ID, uvr5_agg = 10, uvr5_tta = False, uvr5_postprocess = False, uvr5_window_size = 512, uvr5_high_end_process = "mirroring", shift_accompaniment=True, progress=gr.Progress()):
+@_serialized
+def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, reverb_intensity = 4, delay_intensity = 0, svc_f0_method = "fcpe", msst_batch_size = 1, msst_num_overlap = 4, msst_normalize = False, msst_use_tta = False, msst_model=DEFAULT_MODEL_ID, uvr5_agg = 10, uvr5_tta = False, uvr5_postprocess = False, uvr5_window_size = 512, uvr5_high_end_process = "mirroring", vocal_postprocess=False, shift_accompaniment=True, progress=gr.Progress()):
     """进行翻唱推理合成"""
     print(f"🎵 [任务开始] SVC模型: {model_dropdown} | 算法: {svc_f0_method} | 升降调: {key_shift} | 混响: {reverb_intensity} | 延迟: {delay_intensity}")
     msst_model = _normalize_msst_model(msst_model)
@@ -911,9 +1032,30 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
     print(f"处理歌曲ID: {song_name_src}")
 
     if is_local_file:
-        safe_name = f"qqmusic_{abs(hash(song_name_src)) % 10000000}"
-        original_song_name = song_name_src
+        original_song_name = os.path.abspath(song_name_src)
+        safe_name = f"local_{_sha256_file(original_song_name)[:16]}"
         song_name_src = safe_name
+        source_cache_name = safe_name
+    else:
+        netease_safe_name = f"netease_{song_name_src}"
+        source_cache_name = netease_safe_name
+
+    cache_key = _get_cache_key(
+        source_cache_name, model_dropdown, key_shift, vocal_vol, inst_vol,
+        reverb_intensity, delay_intensity, svc_f0_method,
+        msst_batch_size, msst_num_overlap, msst_normalize, msst_use_tta, msst_model,
+        uvr5_agg, uvr5_tta, uvr5_postprocess, uvr5_window_size,
+        uvr5_high_end_process, vocal_postprocess, shift_accompaniment
+    )
+    cache_path = f"temp/{sanitize_filename(source_cache_name)}_{cache_key}_SVC.mp3"
+    if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
+        os.utime(cache_path, None)
+        print(f"Cache hit, returning: {cache_path}")
+        progress(1.0, desc="Cache hit, returning directly!")
+        progress_local.progress = None
+        return cache_path, "true"
+
+    if is_local_file:
         separation_name = _msst_cache_base(
             safe_name, msst_model, msst_batch_size, msst_num_overlap,
             msst_normalize, msst_use_tta,
@@ -948,7 +1090,7 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
                     "normalize": msst_normalize,
                     "use_tta": msst_use_tta,
                 },
-                release_after=True,
+                release_after=not MSST_KEEP_MODEL_LOADED,
                 model_name=msst_model,
             )
 
@@ -958,7 +1100,6 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
             if not (vocal_path and os.path.isfile(vocal_path)):
                 raise gr.Error(f"MSST separation failed: {vocal_path}")
     else:
-        netease_safe_name = f"netease_{song_name_src}"
         separation_name = _msst_cache_base(
             netease_safe_name, msst_model, msst_batch_size, msst_num_overlap,
             msst_normalize, msst_use_tta,
@@ -975,24 +1116,6 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
             )
         else:
             print("✅ 网易云歌曲已缓存，跳过下载和分离")
-
-    # ========== 缓存检查 ==========
-    cache_key = _get_cache_key(
-        song_name_src if is_local_file else netease_safe_name,
-        model_dropdown, key_shift, vocal_vol, inst_vol,
-        reverb_intensity, delay_intensity, svc_f0_method,
-        msst_batch_size, msst_num_overlap, msst_normalize, msst_use_tta, msst_model,
-        uvr5_agg, uvr5_tta, uvr5_postprocess, uvr5_window_size,
-        uvr5_high_end_process, shift_accompaniment
-    )
-    cache_name = song_name_src if is_local_file else netease_safe_name
-    cache_path = f"temp/{sanitize_filename(cache_name)}_{cache_key}_SVC.mp3"
-    if os.path.isfile(cache_path):
-        print(f"Cache hit, returning: {cache_path}")
-        progress(1.0, desc="Cache hit, returning directly!")
-        progress_local.progress = None
-        return cache_path, "true"
-    # =============================
 
     status_msg, speaker_id = load_model_ui(model_dropdown)
     progress(0.55, desc="SVC模型加载中...")
@@ -1044,10 +1167,10 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
         PeakFilter(cutoff_frequency_hz=7000, gain_db=-3.0, q=2.0),
         LowpassFilter(cutoff_frequency_hz=16000),
         Compressor(threshold_db=-18.0, ratio=4.0, attack_ms=5.0, release_ms=150.0),
-    ]
+    ] if vocal_postprocess else []
 
     # ========== 只有当用户开启延迟时，才执行所有相关计算 ==========
-    if delay_intensity > 0:
+    if vocal_postprocess and delay_intensity > 0:
         print("🎤 启用回声效果，开始准备参数...")
         try:
             print("🎵 正在检测歌曲BPM...")
@@ -1072,11 +1195,13 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
         effects.append(Delay(delay_seconds=delay_seconds_val, feedback=0.25, mix=delay_mix_val))
     # ==========================================================
 
-    effects.append(Reverb(room_size=room_size_val, damping=0.4, wet_level=wet_level_val, dry_level=dry_level_val, width=0.8))
+    if vocal_postprocess and reverb_intensity > 0:
+        effects.append(Reverb(room_size=room_size_val, damping=0.4, wet_level=wet_level_val, dry_level=dry_level_val, width=0.8))
 
     board = Pedalboard(effects)
-    processed = board(audio_data, sr)
-    processed_int16 = (processed.T * 32768).astype(np.int16)
+    processed = board(audio_data, sr) if effects else audio_data
+    processed = np.clip(processed, -1.0, 1.0 - (1.0 / 32768.0))
+    processed_int16 = np.rint(processed.T * 32768.0).astype(np.int16)
     processed_audio = AudioSegment(processed_int16.tobytes(), frame_rate=sr, sample_width=2, channels=processed.shape[0])
     normalized_audio = normalize(processed_audio + vocal_vol, headroom=-1.0)
 
@@ -1093,6 +1218,10 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
             shifted_inst_path = f"temp/shifted_{song_name_src}_inst.wav"
             soundfile.write(shifted_inst_path, y_shifted, sr_inst)
             audio_inst = AudioSegment.from_file(shifted_inst_path, format="wav")
+            try:
+                os.remove(shifted_inst_path)
+            except OSError:
+                pass
             print(f"✅ 伴奏音高调整完成")
         except Exception as e:
             print(f"⚠️ 伴奏音高调整失败，使用原始伴奏: {e}")
@@ -1106,12 +1235,15 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
 
     audio_inst = audio_inst + inst_vol
     combined_audio = normalized_audio.overlay(audio_inst)
+    if combined_audio.max_dBFS > -1.0:
+        combined_audio = combined_audio.apply_gain(-1.0 - combined_audio.max_dBFS)
 
     # 确保 temp 目录存在
     os.makedirs("temp", exist_ok=True)
 
     output_filename = cache_path
-    combined_audio.export(output_filename, format="MP3", bitrate="192k")
+    combined_audio.export(output_filename, format="MP3", bitrate=OUTPUT_BITRATE)
+    _trim_cache()
     if os.path.isfile(inferred_audio_path): os.remove(inferred_audio_path)
     print(f"✅ 已导出: {output_filename}")
     progress(0.95, desc="导出最终音频文件...")
@@ -1178,12 +1310,13 @@ with app:
     api_uvr5_postprocess = gr.Checkbox(value=False, visible=False)
     api_uvr5_window_size = gr.Dropdown(choices=[256, 512, 1024], value=512, visible=False)
     api_uvr5_high_end_process = gr.Dropdown(choices=["mirroring", "none"], value="mirroring", visible=False)
+    api_vocal_postprocess = gr.Checkbox(value=False, visible=False)
     api_shift_accompaniment = gr.Checkbox(value=True, visible=False)
     api_output = gr.Audio(visible=False)
     api_cache_flag = gr.Textbox(visible=False)
     gr.Button("API Convert", visible=False).click(
         convert,
-        inputs=[inp1, inp5, inp6, inp7, api_model_name, inp_reverb, inp_delay, api_svc_f0_method, api_msst_batch_size, api_msst_num_overlap, api_msst_normalize, api_msst_use_tta, api_msst_model, api_uvr5_agg, api_uvr5_tta, api_uvr5_postprocess, api_uvr5_window_size, api_uvr5_high_end_process, api_shift_accompaniment],
+        inputs=[inp1, inp5, inp6, inp7, api_model_name, inp_reverb, inp_delay, api_svc_f0_method, api_msst_batch_size, api_msst_num_overlap, api_msst_normalize, api_msst_use_tta, api_msst_model, api_uvr5_agg, api_uvr5_tta, api_uvr5_postprocess, api_uvr5_window_size, api_uvr5_high_end_process, api_vocal_postprocess, api_shift_accompaniment],
         outputs=[api_output, api_cache_flag],
         api_name="convert"
     )
@@ -1205,6 +1338,12 @@ with app:
         outputs=[gr.JSON(visible=False)],
         api_name="select_msst_model"
     )
+    cache_scope = gr.Textbox(value="all", visible=False)
+    cache_json = gr.JSON(visible=False)
+    app.load(cache_info, inputs=[], outputs=cache_json, api_name="cache_info")
+    gr.Button("API Clear Cache", visible=False).click(
+        clear_cache, inputs=[cache_scope], outputs=[cache_json], api_name="clear_cache"
+    )
     gr.Markdown("### <center>注意❗：请不要生成会对个人以及组织造成侵害的内容，此程序仅供科研、学习及个人娱乐使用。</center>")
     gr.HTML('''<div class="footer"><p>🌊🏞️🎶 - 江水东流急，滔滔无尽声。 明·顾璘</p></div>''')
 
@@ -1216,5 +1355,10 @@ if initial_models:
 else:
     print("Warning: failed to load model list, ensure SVC-Fusion is running")
 
-app.queue(max_size=40, api_open=True)
-app.launch(server_name="0.0.0.0", server_port=9999, share=True, show_error=True)
+app.queue(max_size=40, api_open=True, default_concurrency_limit=1)
+app.launch(
+    server_name=os.environ.get("RVCSVC_HOST", "127.0.0.1"),
+    server_port=9999,
+    share=_env_flag("RVCSVC_SHARE", False),
+    show_error=_env_flag("RVCSVC_SHOW_ERROR", False),
+)

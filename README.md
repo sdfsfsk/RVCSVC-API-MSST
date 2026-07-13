@@ -92,12 +92,18 @@ svc_base_url = http://127.0.0.1:9999/
 - `/show_model`：读取上游 RVC/SVC 模型。
 - `/show_msst_models`：返回可用分离模型列表。
 - `/select_msst_model`：验证并切换默认 MSST 分离模型。
+- `/cache_info`：返回结果缓存与分离缓存的文件数、占用空间。
+- `/clear_cache`：在无推理任务运行时清理 `all`、`results` 或 `separation` 缓存。
 - 结果按歌曲、音色模型、分离模型及全部关键参数哈希保存在 `temp/`。
 - `app.queue(..., api_open=True)` 必须保持启用，否则 AstrBot 的 `gradio_client` 无法调用。
 
 ## 性能与质量建议
 
 - `model_bs_roformer_ep_317_sdr_12.9755.ckpt` 适合作为默认高质量人声模型。
+- 默认让当前 MSST 模型常驻显存，连续点歌不再每首重复加载权重；显存紧张时设置 `MSST_KEEP_MODEL_LOADED=0` 恢复每次释放。
+- 本地音频按内容 SHA256 缓存，RVC/SVC 与 MSST 模型资产变化都会使旧结果缓存自动失效。
+- 默认关闭二次 EQ/压缩/混响以保留上游音质；插件开启 `vocal_postprocess` 后才应用这些效果。最终导出带削峰保护，默认 320 kbps。
+- `RVCSVC_CACHE_MAX_FILES`（默认 200）限制缓存增长；服务默认只监听 `127.0.0.1`，可通过 `RVCSVC_HOST` 显式修改。
 - 16 GB 显存建议从 `batch_size=2`、`num_overlap=2～4` 开始。
 - 增大 overlap 或启用 TTA 可能提高平滑度，但会增加耗时和显存占用。
 - 长歌曲在 AMD 上可能需要较长时间，插件 `inference_timeout` 建议设置到 `9000` 秒。
@@ -112,4 +118,3 @@ svc_base_url = http://127.0.0.1:9999/
 ## 来源与许可状态
 
 中间层基于 [CCYellowStar2/RVCSVC-API](https://github.com/CCYellowStar2/RVCSVC-API) 修改；该上游仓库在本项目发布时未声明开源许可证，因此本仓库不擅自为继承代码授予额外许可。MSST/BS-Roformer 第三方组件及其许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-
